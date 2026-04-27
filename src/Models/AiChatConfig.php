@@ -50,7 +50,7 @@ class AiChatConfig extends BaseServiceConfigModel
             case 'default_data_services':
                 $schema['label'] = 'Default Data Services';
                 $schema['type'] = 'text';
-                $schema['description'] = 'JSON array of DreamFactory service names the AI can access by default. Example: ["dellstore_db","hr_db"]';
+                $schema['description'] = 'Optional JSON array of DreamFactory service names the AI can access. Example: ["dellstore_db","hr_db"]. Leave blank to default to every service the AI Role grants access to.';
                 break;
 
             case 'system_prompt':

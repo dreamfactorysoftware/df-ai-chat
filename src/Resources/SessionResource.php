@@ -17,6 +17,8 @@ use DreamFactory\Core\Enums\ServiceRequestorTypes;
 use DreamFactory\Core\Exceptions\BadRequestException;
 use DreamFactory\Core\Exceptions\ForbiddenException;
 use DreamFactory\Core\Exceptions\NotFoundException;
+use DreamFactory\Core\Models\RoleServiceAccess;
+use DreamFactory\Core\Models\Service;
 use DreamFactory\Core\Models\User;
 use DreamFactory\Core\Models\UserAppRole;
 use DreamFactory\Core\Resources\BaseRestResource;
@@ -124,6 +126,10 @@ class SessionResource extends BaseRestResource
         }
 
         // Resolve data services.
+        // Precedence: payload → service config default → derived from AI role's access list.
+        // The role-derived fallback means an admin who set an AI role but skipped
+        // default_data_services gets "everything the role allows" automatically,
+        // rather than a configuration error.
         $dataServices = $payload['data_services'] ?? null;
         if ($dataServices === null) {
             $defaults = $serviceConfig['default_data_services'] ?? null;
@@ -133,9 +139,14 @@ class SessionResource extends BaseRestResource
                 $dataServices = $defaults;
             }
         }
+        if (empty($dataServices) || !is_array($dataServices)) {
+            $dataServices = $this->deriveDataServicesFromRole($aiRoleId);
+        }
 
         if (empty($dataServices) || !is_array($dataServices)) {
-            throw new BadRequestException('data_services must be a non-empty array of DreamFactory service names.');
+            throw new BadRequestException(
+                'No data services available for this chat session. Set data_services in the request, default_data_services in the service config, or grant the AI role access to at least one service.'
+            );
         }
 
         $allowedResources = $payload['allowed_resources'] ?? null;
@@ -312,6 +323,37 @@ class SessionResource extends BaseRestResource
     // ────────────────────────────────────────────────────────
     // Helpers
     // ────────────────────────────────────────────────────────
+
+    /**
+     * Derive the list of data service names from a role's service access grants.
+     *
+     * Returns the unique service names the role has any access to, excluding
+     * the wildcard service_id=0 (which means "all services" — too broad to
+     * default to without explicit admin intent).
+     *
+     * @return array<int,string>
+     */
+    private function deriveDataServicesFromRole(int $roleId): array
+    {
+        if ($roleId <= 0) {
+            return [];
+        }
+
+        $serviceIds = RoleServiceAccess::where('role_id', $roleId)
+            ->where('service_id', '>', 0)
+            ->pluck('service_id')
+            ->unique()
+            ->values()
+            ->all();
+
+        if (empty($serviceIds)) {
+            return [];
+        }
+
+        return Service::whereIn('id', $serviceIds)
+            ->pluck('name')
+            ->all();
+    }
 
     /**
      * Find a session, ensuring ownership unless admin.
