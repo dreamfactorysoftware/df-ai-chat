@@ -327,9 +327,12 @@ class SessionResource extends BaseRestResource
     /**
      * Derive the list of data service names from a role's service access grants.
      *
-     * Returns the unique service names the role has any access to, excluding
-     * the wildcard service_id=0 (which means "all services" — too broad to
-     * default to without explicit admin intent).
+     * - If the role has explicit per-service grants, return those service names.
+     * - If the role has only a wildcard row (service_id NULL or 0 = "all
+     *   services"), expand it to every data-bearing service in the catalog.
+     *   System / AI / docs services are excluded — the AI doesn't need to
+     *   query itself or the admin surface.
+     * - If the role has no grants at all, return [].
      *
      * @return array<int,string>
      */
@@ -339,18 +342,40 @@ class SessionResource extends BaseRestResource
             return [];
         }
 
-        $serviceIds = RoleServiceAccess::where('role_id', $roleId)
-            ->where('service_id', '>', 0)
-            ->pluck('service_id')
-            ->unique()
-            ->values()
-            ->all();
-
-        if (empty($serviceIds)) {
+        $rows = RoleServiceAccess::where('role_id', $roleId)->get();
+        if ($rows->isEmpty()) {
             return [];
         }
 
-        return Service::whereIn('id', $serviceIds)
+        $explicitIds = $rows
+            ->filter(fn ($r) => $r->service_id !== null && $r->service_id > 0)
+            ->pluck('service_id')
+            ->unique()
+            ->values();
+
+        $hasWildcard = $rows->contains(
+            fn ($r) => $r->service_id === null || $r->service_id === 0
+        );
+
+        if ($hasWildcard) {
+            // Expand to every data-bearing service. Exclude AI, MCP, system,
+            // and api-docs services — the AI shouldn't query itself or admin.
+            $excludedTypes = [
+                'ai_connection', 'ai_chat', 'mcp',
+                'system', 'swagger', 'api_docs',
+                'user',
+            ];
+            return Service::whereNotIn('type', $excludedTypes)
+                ->where('is_active', true)
+                ->pluck('name')
+                ->all();
+        }
+
+        if ($explicitIds->isEmpty()) {
+            return [];
+        }
+
+        return Service::whereIn('id', $explicitIds->all())
             ->pluck('name')
             ->all();
     }
@@ -382,31 +407,76 @@ class SessionResource extends BaseRestResource
     /**
      * Generate a JWT token for the AI role.
      *
-     * Finds a user assigned to the AI role and creates a session token
-     * that carries that role's restricted permissions.
+     * Looks for an existing user assigned to the role; falls back to
+     * lazily provisioning a synthetic agent user if none exists. The
+     * agent user carries the AI role's permissions and is the identity
+     * data-tool calls run under during the chat loop.
      *
      * @throws ChatException
      */
     private function generateAiToken(int $aiRoleId): string
     {
-        // Find a user assigned to this role.
         $userAppRole = UserAppRole::where('role_id', $aiRoleId)->first();
 
-        if (!$userAppRole) {
-            throw new ChatException(
-                "No user is assigned to AI role ID {$aiRoleId}. "
-                . 'Create a dedicated user and assign it the AI role.'
-            );
+        if ($userAppRole) {
+            $user = User::find($userAppRole->user_id);
+            if ($user) {
+                return JWTUtilities::makeJWTByUser($user->id, $user->email);
+            }
         }
 
-        $user = User::find($userAppRole->user_id);
-        if (!$user) {
-            throw new ChatException(
-                "User ID {$userAppRole->user_id} for AI role not found."
-            );
-        }
-
+        // No user assigned to this role. Auto-provision a synthetic agent
+        // user so the chat just works without forcing the admin to manage
+        // ai-agent users by hand. Idempotent — re-uses the same agent on
+        // subsequent calls.
+        $user = $this->ensureAiAgentUser($aiRoleId);
         return JWTUtilities::makeJWTByUser($user->id, $user->email);
+    }
+
+    /**
+     * Find or create an agent user dedicated to the given AI role.
+     *
+     * The user lives at ai-agent-role-{N}@dreamfactory.local with an
+     * unguessable random password (it never logs in interactively —
+     * tokens are minted directly via makeJWTByUser). A UserAppRole row
+     * links the user to the role for any future lookups.
+     */
+    private function ensureAiAgentUser(int $aiRoleId): User
+    {
+        $email = "ai-agent-role-{$aiRoleId}@dreamfactory.local";
+        $user = User::where('email', $email)->first();
+
+        if (!$user) {
+            $user = User::create([
+                'email'        => $email,
+                'username'     => "ai-agent-role-{$aiRoleId}",
+                'name'         => "AI Agent (role {$aiRoleId})",
+                'first_name'   => 'AI',
+                'last_name'    => "Agent {$aiRoleId}",
+                'password'     => bcrypt(bin2hex(random_bytes(32))),
+                'is_active'    => true,
+                'is_sys_admin' => false,
+            ]);
+        }
+
+        // Ensure the link row exists so downstream lookups (and future
+        // generateAiToken calls) find the user via UserAppRole. The link
+        // requires an app_id — use the admin app (id=1) which always exists
+        // in a DF install. The app picks the API key, but the role drives
+        // permissions, so any app works here.
+        $existing = UserAppRole::where('user_id', $user->id)
+            ->where('role_id', $aiRoleId)
+            ->first();
+        if (!$existing) {
+            $appId = \DreamFactory\Core\Models\App::min('id') ?: 1;
+            UserAppRole::create([
+                'user_id' => $user->id,
+                'role_id' => $aiRoleId,
+                'app_id'  => $appId,
+            ]);
+        }
+
+        return $user;
     }
 
     // ────────────────────────────────────────────────────────
