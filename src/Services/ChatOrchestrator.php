@@ -6,6 +6,8 @@ namespace DreamFactory\Core\AIChat\Services;
 
 use DreamFactory\Core\AI\Providers\AiProviderInterface;
 use DreamFactory\Core\AI\Providers\ToolDefinition;
+use DreamFactory\Core\AI\Utility\AuditDispatcher;
+use DreamFactory\Core\AI\Utility\PromptLogger;
 use DreamFactory\Core\AI\Utility\UsageLogger;
 use DreamFactory\Core\AIChat\Exceptions\ChatException;
 use DreamFactory\Core\AIChat\Models\AiChatMessage;
@@ -128,6 +130,27 @@ class ChatOrchestrator
                         : 0,
                 ],
                 $latencyMs,
+            );
+
+            // Audit log: per-AI-Connection opt-in prompt + response with
+            // PII redaction; SIEM webhook + file sink dispatch. The
+            // request_id correlates across ai_usage_log, ai_prompt_log,
+            // and the SIEM event for forensics joins.
+            PromptLogger::record(
+                (int) $this->session->ai_service_id,
+                self::USAGE_RESOURCE,
+                (string) ($result['provider'] ?? $this->provider->getProviderName()),
+                (string) ($result['model'] ?? ''),
+                $userMessage, // Just the user's most recent message — full
+                              // history is reconstructible from ai_chat_messages
+                              // via the session_id. Keep prompt log size bounded.
+                (string) ($result['content'] ?? ''),
+                UsageLogger::requestId(),
+                'success',
+            );
+            AuditDispatcher::dispatch(
+                (int) $this->session->ai_service_id,
+                UsageLogger::requestId(),
             );
 
             // No tool calls — AI produced a final text response.
