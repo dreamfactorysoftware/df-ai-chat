@@ -34,6 +34,7 @@ class ChatOrchestrator
 
     private AiProviderInterface $provider;
     private DataToolClient $toolClient;
+    private ?McpToolClient $mcpClient;
 
     /** @var ToolDefinition[] */
     private array $tools;
@@ -47,9 +48,11 @@ class ChatOrchestrator
         DataToolClient $toolClient,
         array $tools,
         AiChatSession $session,
+        ?McpToolClient $mcpClient = null,
     ) {
         $this->provider = $provider;
         $this->toolClient = $toolClient;
+        $this->mcpClient = $mcpClient;
         $this->tools = $tools;
         $this->session = $session;
         $this->maxIterations = (int) ($session->chatConfig?->max_tool_calls
@@ -206,30 +209,31 @@ class ChatOrchestrator
     // ────────────────────────────────────────────────────────
 
     /**
-     * Execute a single tool call with security validation.
+     * Execute a single tool call.
+     *
+     * Routes by tool-name prefix:
+     *   `mcp_<svc>__<tool>`   → MCP service via McpToolClient
+     *   `<svc>__<tool>`       → data service via DataToolClient
+     *
+     * Access control is enforced at the wire — every dispatched call
+     * carries the AI agent's JWT + the role-bound app's API key, and
+     * DreamFactory's standard RBAC pipeline gates the request server-side.
+     * The orchestrator does NOT pre-filter against an allow-list anymore:
+     * Captain's directive is "the role is the only bottleneck", and
+     * every parallel allow-list we used to keep is now removed. If the
+     * role lost access since session creation, the call gets a 403 and
+     * we surface it back to the AI as a tool error.
      *
      * @return array{content: string, is_error: bool, latency_ms: int}
      */
     private function executeTool(array $toolCall): array
     {
-        [$serviceName, $toolName] = ToolRegistry::parseToolName($toolCall['name']);
-
-        // Security checks: service must be in session scope; if the tool
-        // targets a specific table, that table must be in allowed_resources.
-        $violation = self::checkToolAccess(
-            $serviceName,
-            $toolCall['arguments']['tableName'] ?? null,
-            $this->session->data_services ?? [],
-            $this->session->allowed_resources,
-        );
-        if ($violation !== null) {
-            return ['content' => $violation, 'is_error' => true, 'latency_ms' => 0];
-        }
-
         $start = hrtime(true);
 
         try {
-            $data = $this->toolClient->executeTool($serviceName, $toolName, $toolCall['arguments']);
+            $data = ToolRegistry::isMcpTool($toolCall['name'])
+                ? $this->dispatchMcpTool($toolCall)
+                : $this->dispatchDataTool($toolCall);
             $latencyMs = (int) ((hrtime(true) - $start) / 1_000_000);
 
             $content = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
@@ -258,37 +262,31 @@ class ChatOrchestrator
     }
 
     /**
-     * Pure access-control check for a tool invocation. Returns null when the
-     * call is permitted; otherwise returns the human-readable error message
-     * that should be sent back to the AI as the tool's "result".
-     *
-     * The two rules enforced here back up DreamFactory's RBAC at the AI layer
-     * — even if the AI hallucinates a tool call against a service or table it
-     * shouldn't see, this short-circuits before any HTTP hits the data API.
-     *
-     * @param string[]      $dataServices      services in session scope
-     * @param array<string, string[]>|null $allowedResources  per-service
-     *        allow-list of tables; null means "all tables permitted"
+     * Dispatch a data-service tool call. Errors propagate; the executeTool
+     * caller catches them and surfaces them to the AI as tool results.
      */
-    public static function checkToolAccess(
-        string $serviceName,
-        ?string $tableName,
-        array $dataServices,
-        ?array $allowedResources,
-    ): ?string {
-        if (!in_array($serviceName, $dataServices, true)) {
-            return "Error: Service '{$serviceName}' is not available in this chat session.";
+    private function dispatchDataTool(array $toolCall): array
+    {
+        [$serviceName, $toolName] = ToolRegistry::parseToolName($toolCall['name']);
+        return $this->toolClient->executeTool($serviceName, $toolName, $toolCall['arguments'] ?? []);
+    }
+
+    /**
+     * Dispatch an MCP-service tool call via JSON-RPC. The orchestrator
+     * routes here when the tool name starts with the `mcp_` family
+     * prefix that ToolRegistry::buildMcpServiceTools() emits.
+     */
+    private function dispatchMcpTool(array $toolCall): array
+    {
+        if ($this->mcpClient === null) {
+            throw new ChatException(
+                'MCP tool dispatched but no McpToolClient was attached to this orchestrator.'
+            );
         }
 
-        if ($tableName !== null
-            && $allowedResources !== null
-            && isset($allowedResources[$serviceName])
-            && !in_array($tableName, $allowedResources[$serviceName], true)
-        ) {
-            return "Error: Table '{$tableName}' is not in the allowed resources for this session.";
-        }
-
-        return null;
+        [$prefix, $toolName] = ToolRegistry::parseToolName($toolCall['name']);
+        $svcName = ToolRegistry::unwrapMcpServiceName($prefix);
+        return $this->mcpClient->callTool($svcName, $toolName, $toolCall['arguments'] ?? []);
     }
 
     /**

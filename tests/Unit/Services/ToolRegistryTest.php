@@ -188,6 +188,59 @@ class ToolRegistryTest extends TestCase
         }
     }
 
+    // ─── MCP prefix routing ───────────────────────────────────────────────
+
+    public function testIsMcpToolDetectsMcpPrefix(): void
+    {
+        // "mcp_<svc>__<tool>" is the wire shape buildMcpServiceTools emits.
+        // The orchestrator routes by this prefix to McpToolClient instead
+        // of DataToolClient, so the detection has to be precise.
+        $this->assertTrue(ToolRegistry::isMcpTool('mcp_internal__some_tool'));
+        $this->assertTrue(ToolRegistry::isMcpTool('mcp_a__b'));
+    }
+
+    public function testIsMcpToolDoesNotMisclassifyDataServices(): void
+    {
+        // A data service literally named "mcp_archive" would parse to
+        // service="mcp_archive" — also starts with mcp_ and gets routed
+        // as MCP. That's a known limitation; the workaround is "don't
+        // name a data service starting with mcp_". The OpposITE direction
+        // — making sure regular data tools don't trip the check — is
+        // what we MUST guarantee.
+        $this->assertFalse(ToolRegistry::isMcpTool('mysql__get_tables'));
+        $this->assertFalse(ToolRegistry::isMcpTool('analytics__get_table_data'));
+        $this->assertFalse(ToolRegistry::isMcpTool('not_mcp_thing__get_tables'));
+    }
+
+    public function testIsMcpToolHandlesMalformedNames(): void
+    {
+        // No delimiter → empty service → not MCP. Don't crash.
+        $this->assertFalse(ToolRegistry::isMcpTool('garbage'));
+        $this->assertFalse(ToolRegistry::isMcpTool(''));
+    }
+
+    public function testUnwrapMcpServiceNameStripsPrefix(): void
+    {
+        $this->assertSame('internal', ToolRegistry::unwrapMcpServiceName('mcp_internal'));
+        $this->assertSame('weather_api', ToolRegistry::unwrapMcpServiceName('mcp_weather_api'));
+    }
+
+    public function testUnwrapMcpServiceNameLeavesNonMcpAlone(): void
+    {
+        // For non-MCP service portions, the function is the identity.
+        // (orchestrator only calls it after isMcpTool returns true, but
+        // be defensive: a stray call shouldn't mangle a data service name.)
+        $this->assertSame('mysql', ToolRegistry::unwrapMcpServiceName('mysql'));
+        $this->assertSame('', ToolRegistry::unwrapMcpServiceName(''));
+    }
+
+    public function testUnwrapMcpServiceNameStripsOnlyOnce(): void
+    {
+        // "mcp_mcp_double" → "mcp_double" (only the first prefix is
+        // stripped; a service legitimately named "mcp_double" stays).
+        $this->assertSame('mcp_double', ToolRegistry::unwrapMcpServiceName('mcp_mcp_double'));
+    }
+
     /**
      * @param ToolDefinition[] $tools
      * @return array<string, ToolDefinition>
