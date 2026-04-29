@@ -6,6 +6,7 @@ namespace DreamFactory\Core\AIChat\Services;
 
 use DreamFactory\Core\AI\Providers\AiProviderInterface;
 use DreamFactory\Core\AI\Providers\ToolDefinition;
+use DreamFactory\Core\AI\Utility\UsageLogger;
 use DreamFactory\Core\AIChat\Exceptions\ChatException;
 use DreamFactory\Core\AIChat\Models\AiChatMessage;
 use DreamFactory\Core\AIChat\Models\AiChatSession;
@@ -22,6 +23,15 @@ use Illuminate\Support\Facades\Log;
  */
 class ChatOrchestrator
 {
+    /**
+     * Resource label for ai_usage_log rows written from this orchestrator.
+     * Distinct from `chat` (direct REST gateway calls) so the dashboard's
+     * by_resource breakdown can split chat-UI traffic from API-client
+     * traffic. Both still group under the same AI Connection, so cost
+     * attribution against monthly_budget_usd stays correct.
+     */
+    public const USAGE_RESOURCE = 'chat-session';
+
     private AiProviderInterface $provider;
     private DataToolClient $toolClient;
 
@@ -74,11 +84,48 @@ class ChatOrchestrator
         for ($iteration = 0; $iteration < $this->maxIterations; $iteration++) {
             $start = hrtime(true);
 
-            $result = $this->provider->chatWithTools($messages, $this->tools);
+            try {
+                $result = $this->provider->chatWithTools($messages, $this->tools);
+            } catch (\Throwable $e) {
+                // Log the failed provider call to ai_usage_log so the
+                // dashboard reflects orchestrator-side errors, not just
+                // direct-chat ones. Then re-raise so the caller still sees
+                // the original exception.
+                $latencyMs = (int) ((hrtime(true) - $start) / 1_000_000);
+                UsageLogger::logError(
+                    (int) $this->session->ai_service_id,
+                    self::USAGE_RESOURCE,
+                    $this->provider->getProviderName(),
+                    (string) ($this->session->chatConfig?->default_model ?? ''),
+                    $latencyMs,
+                    $e->getMessage(),
+                );
+                throw $e;
+            }
 
             $latencyMs = (int) ((hrtime(true) - $start) / 1_000_000);
             $totalInputTokens += $result['input_tokens'] ?? 0;
             $totalOutputTokens += $result['output_tokens'] ?? 0;
+
+            // Log this provider call to ai_usage_log so the dashboard
+            // (which reads ai_usage_log, not ai_chat_sessions) sees chat
+            // traffic alongside direct-chat traffic. tool_call_count is
+            // populated per-call so the by_resource breakdown can attribute
+            // tool-loop iterations back to chat sessions.
+            UsageLogger::logSuccess(
+                (int) $this->session->ai_service_id,
+                self::USAGE_RESOURCE,
+                [
+                    'provider'        => $result['provider'] ?? $this->provider->getProviderName(),
+                    'model'           => $result['model'] ?? '',
+                    'input_tokens'    => (int) ($result['input_tokens'] ?? 0),
+                    'output_tokens'   => (int) ($result['output_tokens'] ?? 0),
+                    'tool_call_count' => is_array($result['tool_calls'] ?? null)
+                        ? count($result['tool_calls'])
+                        : 0,
+                ],
+                $latencyMs,
+            );
 
             // No tool calls — AI produced a final text response.
             if (empty($result['tool_calls'])) {
