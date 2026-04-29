@@ -167,26 +167,16 @@ class ChatOrchestrator
     {
         [$serviceName, $toolName] = ToolRegistry::parseToolName($toolCall['name']);
 
-        // Security check: service must be in session scope.
-        if (!in_array($serviceName, $this->session->data_services ?? [], true)) {
-            return [
-                'content'    => "Error: Service '{$serviceName}' is not available in this chat session.",
-                'is_error'   => true,
-                'latency_ms' => 0,
-            ];
-        }
-
-        // Security check: table must be in allowed_resources (if set).
-        $tableName = $toolCall['arguments']['tableName'] ?? null;
-        $allowedResources = $this->session->allowed_resources;
-        if ($tableName !== null && $allowedResources !== null && isset($allowedResources[$serviceName])) {
-            if (!in_array($tableName, $allowedResources[$serviceName], true)) {
-                return [
-                    'content'    => "Error: Table '{$tableName}' is not in the allowed resources for this session.",
-                    'is_error'   => true,
-                    'latency_ms' => 0,
-                ];
-            }
+        // Security checks: service must be in session scope; if the tool
+        // targets a specific table, that table must be in allowed_resources.
+        $violation = self::checkToolAccess(
+            $serviceName,
+            $toolCall['arguments']['tableName'] ?? null,
+            $this->session->data_services ?? [],
+            $this->session->allowed_resources,
+        );
+        if ($violation !== null) {
+            return ['content' => $violation, 'is_error' => true, 'latency_ms' => 0];
         }
 
         $start = hrtime(true);
@@ -196,12 +186,7 @@ class ChatOrchestrator
             $latencyMs = (int) ((hrtime(true) - $start) / 1_000_000);
 
             $content = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-
-            // Truncate large results to prevent context-window overflow.
-            if (strlen($content) > $this->maxResultLength) {
-                $content = substr($content, 0, $this->maxResultLength)
-                    . "\n...[TRUNCATED at {$this->maxResultLength} chars. Use filter/limit to narrow results.]";
-            }
+            $content = self::truncateToolResult($content, $this->maxResultLength);
 
             return [
                 'content'    => $content,
@@ -223,6 +208,54 @@ class ChatOrchestrator
                 'latency_ms' => $latencyMs,
             ];
         }
+    }
+
+    /**
+     * Pure access-control check for a tool invocation. Returns null when the
+     * call is permitted; otherwise returns the human-readable error message
+     * that should be sent back to the AI as the tool's "result".
+     *
+     * The two rules enforced here back up DreamFactory's RBAC at the AI layer
+     * — even if the AI hallucinates a tool call against a service or table it
+     * shouldn't see, this short-circuits before any HTTP hits the data API.
+     *
+     * @param string[]      $dataServices      services in session scope
+     * @param array<string, string[]>|null $allowedResources  per-service
+     *        allow-list of tables; null means "all tables permitted"
+     */
+    public static function checkToolAccess(
+        string $serviceName,
+        ?string $tableName,
+        array $dataServices,
+        ?array $allowedResources,
+    ): ?string {
+        if (!in_array($serviceName, $dataServices, true)) {
+            return "Error: Service '{$serviceName}' is not available in this chat session.";
+        }
+
+        if ($tableName !== null
+            && $allowedResources !== null
+            && isset($allowedResources[$serviceName])
+            && !in_array($tableName, $allowedResources[$serviceName], true)
+        ) {
+            return "Error: Table '{$tableName}' is not in the allowed resources for this session.";
+        }
+
+        return null;
+    }
+
+    /**
+     * Cap a JSON-serialized tool result so it can't blow the AI's context
+     * window. When truncated, an explicit marker is appended so the AI knows
+     * to narrow its query rather than hallucinate continuation.
+     */
+    public static function truncateToolResult(string $content, int $maxLength): string
+    {
+        if ($maxLength <= 0 || strlen($content) <= $maxLength) {
+            return $content;
+        }
+        return substr($content, 0, $maxLength)
+            . "\n...[TRUNCATED at {$maxLength} chars. Use filter/limit to narrow results.]";
     }
 
     // ────────────────────────────────────────────────────────
