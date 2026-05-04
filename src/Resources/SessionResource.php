@@ -68,7 +68,10 @@ class SessionResource extends BaseRestResource
     {
         $session = $this->findSession($sessionId, $userId);
 
-        $limit = (int) $this->request->getParameter('message_limit', 50);
+        // Clamp upper bound — caller-supplied values were previously cast
+        // to int but never bounded, so `?message_limit=10000000` would
+        // materialize ten million rows.
+        $limit = max(1, min(500, (int) $this->request->getParameter('message_limit', 50)));
         $messages = AiChatMessage::where('session_id', $session->id)
             ->orderBy('created_at', 'desc')
             ->orderBy('id', 'desc')
@@ -268,7 +271,10 @@ class SessionResource extends BaseRestResource
                     'No roles are configured for this AI service. An admin must assign allowed roles before the AI can access data.'
                 );
             }
-            if (!in_array($aiRoleId, $allowedRoles, false)) {
+            // Normalize to ints so admin configs that stored role IDs as JSON
+            // strings still match the int $aiRoleId under strict comparison.
+            $allowedRoles = array_map('intval', $allowedRoles);
+            if (!in_array($aiRoleId, $allowedRoles, true)) {
                 throw new ForbiddenException(
                     "The AI role (ID: {$aiRoleId}) is not in this AI service's allowed roles."
                 );
