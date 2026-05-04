@@ -70,8 +70,11 @@ class SessionResource extends BaseRestResource
 
         // Clamp upper bound — caller-supplied values were previously cast
         // to int but never bounded, so `?message_limit=10000000` would
-        // materialize ten million rows.
-        $limit = max(1, min(500, (int) $this->request->getParameter('message_limit', 50)));
+        // materialize ten million rows. The hard upper bound is sourced
+        // from config so deployments with legitimate large-history needs
+        // can raise it without patching code.
+        $hardMax = (int) config('ai-chat.message_limit_max', 500);
+        $limit = max(1, min($hardMax, (int) $this->request->getParameter('message_limit', 50)));
         $messages = AiChatMessage::where('session_id', $session->id)
             ->orderBy('created_at', 'desc')
             ->orderBy('id', 'desc')

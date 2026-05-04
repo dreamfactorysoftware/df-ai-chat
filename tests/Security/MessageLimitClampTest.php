@@ -55,26 +55,23 @@ class MessageLimitClampTest extends TestCase
 
     public function testMessageLimitMaximumIsSane(): void
     {
-        // The fix should declare an upper bound. We don't insist on a
-        // specific value — anything <= 1000 is reasonable for a chat
-        // history view; anything >= 100000 would be a non-fix.
+        // The fix should declare an upper bound. Either via a numeric
+        // literal, or via a config() call with a sensible default.
         $matches = [];
-        $found = preg_match(
-            '/\$\w*[Ll]imit\s*=\s*min\s*\([^,]+,\s*(\d+)\s*\)/',
+        $hasNumericInline = preg_match(
+            '/\$\w*[Ll]imit\s*=\s*(?:max\s*\([^,]+,\s*)?min\s*\([^,]+,\s*(\d+)\s*\)/',
             $this->contents,
             $matches
-        );
-        if ($found !== 1) {
-            // Try the other order: min(MAX, $candidate)
-            $found = preg_match(
-                '/min\s*\(\s*(\d+)\s*,\s*[^)]+\)/',
-                $this->contents,
-                $matches
-            );
-        }
+        ) === 1;
+        $hasConfigDriven = preg_match(
+            '/config\s*\(\s*[\'"][^\'"]*message_limit_max[\'"]\s*,\s*(\d+)\s*\)/',
+            $this->contents,
+            $matches
+        ) === 1;
 
-        $this->assertSame(1, $found,
-            'A numeric upper bound on message_limit must be present in source'
+        $this->assertTrue(
+            $hasNumericInline || $hasConfigDriven,
+            'A numeric upper bound (or config-driven fallback) on message_limit must be present in source'
         );
         $bound = (int) $matches[1];
         $this->assertGreaterThan(0, $bound);
