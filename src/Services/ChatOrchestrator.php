@@ -6,6 +6,9 @@ namespace DreamFactory\Core\AIChat\Services;
 
 use DreamFactory\Core\AI\Providers\AiProviderInterface;
 use DreamFactory\Core\AI\Providers\ToolDefinition;
+use DreamFactory\Core\AI\Utility\AuditDispatcher;
+use DreamFactory\Core\AI\Utility\PromptLogger;
+use DreamFactory\Core\AI\Utility\UsageLogger;
 use DreamFactory\Core\AIChat\Exceptions\ChatException;
 use DreamFactory\Core\AIChat\Models\AiChatMessage;
 use DreamFactory\Core\AIChat\Models\AiChatSession;
@@ -22,8 +25,18 @@ use Illuminate\Support\Facades\Log;
  */
 class ChatOrchestrator
 {
+    /**
+     * Resource label for ai_usage_log rows written from this orchestrator.
+     * Distinct from `chat` (direct REST gateway calls) so the dashboard's
+     * by_resource breakdown can split chat-UI traffic from API-client
+     * traffic. Both still group under the same AI Connection, so cost
+     * attribution against monthly_budget_usd stays correct.
+     */
+    public const USAGE_RESOURCE = 'chat-session';
+
     private AiProviderInterface $provider;
     private DataToolClient $toolClient;
+    private ?McpToolClient $mcpClient;
 
     /** @var ToolDefinition[] */
     private array $tools;
@@ -37,9 +50,11 @@ class ChatOrchestrator
         DataToolClient $toolClient,
         array $tools,
         AiChatSession $session,
+        ?McpToolClient $mcpClient = null,
     ) {
         $this->provider = $provider;
         $this->toolClient = $toolClient;
+        $this->mcpClient = $mcpClient;
         $this->tools = $tools;
         $this->session = $session;
         $this->maxIterations = (int) ($session->chatConfig?->max_tool_calls
@@ -74,11 +89,69 @@ class ChatOrchestrator
         for ($iteration = 0; $iteration < $this->maxIterations; $iteration++) {
             $start = hrtime(true);
 
-            $result = $this->provider->chatWithTools($messages, $this->tools);
+            try {
+                $result = $this->provider->chatWithTools($messages, $this->tools);
+            } catch (\Throwable $e) {
+                // Log the failed provider call to ai_usage_log so the
+                // dashboard reflects orchestrator-side errors, not just
+                // direct-chat ones. Then re-raise so the caller still sees
+                // the original exception.
+                $latencyMs = (int) ((hrtime(true) - $start) / 1_000_000);
+                UsageLogger::logError(
+                    (int) $this->session->ai_service_id,
+                    self::USAGE_RESOURCE,
+                    $this->provider->getProviderName(),
+                    (string) ($this->session->chatConfig?->default_model ?? ''),
+                    $latencyMs,
+                    $e->getMessage(),
+                );
+                throw $e;
+            }
 
             $latencyMs = (int) ((hrtime(true) - $start) / 1_000_000);
             $totalInputTokens += $result['input_tokens'] ?? 0;
             $totalOutputTokens += $result['output_tokens'] ?? 0;
+
+            // Log this provider call to ai_usage_log so the dashboard
+            // (which reads ai_usage_log, not ai_chat_sessions) sees chat
+            // traffic alongside direct-chat traffic. tool_call_count is
+            // populated per-call so the by_resource breakdown can attribute
+            // tool-loop iterations back to chat sessions.
+            UsageLogger::logSuccess(
+                (int) $this->session->ai_service_id,
+                self::USAGE_RESOURCE,
+                [
+                    'provider'        => $result['provider'] ?? $this->provider->getProviderName(),
+                    'model'           => $result['model'] ?? '',
+                    'input_tokens'    => (int) ($result['input_tokens'] ?? 0),
+                    'output_tokens'   => (int) ($result['output_tokens'] ?? 0),
+                    'tool_call_count' => is_array($result['tool_calls'] ?? null)
+                        ? count($result['tool_calls'])
+                        : 0,
+                ],
+                $latencyMs,
+            );
+
+            // Audit log: per-AI-Connection opt-in prompt + response with
+            // PII redaction; SIEM webhook + file sink dispatch. The
+            // request_id correlates across ai_usage_log, ai_prompt_log,
+            // and the SIEM event for forensics joins.
+            PromptLogger::record(
+                (int) $this->session->ai_service_id,
+                self::USAGE_RESOURCE,
+                (string) ($result['provider'] ?? $this->provider->getProviderName()),
+                (string) ($result['model'] ?? ''),
+                $userMessage, // Just the user's most recent message — full
+                              // history is reconstructible from ai_chat_messages
+                              // via the session_id. Keep prompt log size bounded.
+                (string) ($result['content'] ?? ''),
+                UsageLogger::requestId(),
+                'success',
+            );
+            AuditDispatcher::dispatch(
+                (int) $this->session->ai_service_id,
+                UsageLogger::requestId(),
+            );
 
             // No tool calls — AI produced a final text response.
             if (empty($result['tool_calls'])) {
@@ -159,49 +232,35 @@ class ChatOrchestrator
     // ────────────────────────────────────────────────────────
 
     /**
-     * Execute a single tool call with security validation.
+     * Execute a single tool call.
+     *
+     * Routes by tool-name prefix:
+     *   `mcp_<svc>__<tool>`   → MCP service via McpToolClient
+     *   `<svc>__<tool>`       → data service via DataToolClient
+     *
+     * Access control is enforced at the wire — every dispatched call
+     * carries the AI agent's JWT + the role-bound app's API key, and
+     * DreamFactory's standard RBAC pipeline gates the request server-side.
+     * The orchestrator does NOT pre-filter against an allow-list anymore:
+     * Captain's directive is "the role is the only bottleneck", and
+     * every parallel allow-list we used to keep is now removed. If the
+     * role lost access since session creation, the call gets a 403 and
+     * we surface it back to the AI as a tool error.
      *
      * @return array{content: string, is_error: bool, latency_ms: int}
      */
     private function executeTool(array $toolCall): array
     {
-        [$serviceName, $toolName] = ToolRegistry::parseToolName($toolCall['name']);
-
-        // Security check: service must be in session scope.
-        if (!in_array($serviceName, $this->session->data_services ?? [], true)) {
-            return [
-                'content'    => "Error: Service '{$serviceName}' is not available in this chat session.",
-                'is_error'   => true,
-                'latency_ms' => 0,
-            ];
-        }
-
-        // Security check: table must be in allowed_resources (if set).
-        $tableName = $toolCall['arguments']['tableName'] ?? null;
-        $allowedResources = $this->session->allowed_resources;
-        if ($tableName !== null && $allowedResources !== null && isset($allowedResources[$serviceName])) {
-            if (!in_array($tableName, $allowedResources[$serviceName], true)) {
-                return [
-                    'content'    => "Error: Table '{$tableName}' is not in the allowed resources for this session.",
-                    'is_error'   => true,
-                    'latency_ms' => 0,
-                ];
-            }
-        }
-
         $start = hrtime(true);
 
         try {
-            $data = $this->toolClient->executeTool($serviceName, $toolName, $toolCall['arguments']);
+            $data = ToolRegistry::isMcpTool($toolCall['name'])
+                ? $this->dispatchMcpTool($toolCall)
+                : $this->dispatchDataTool($toolCall);
             $latencyMs = (int) ((hrtime(true) - $start) / 1_000_000);
 
             $content = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-
-            // Truncate large results to prevent context-window overflow.
-            if (strlen($content) > $this->maxResultLength) {
-                $content = substr($content, 0, $this->maxResultLength)
-                    . "\n...[TRUNCATED at {$this->maxResultLength} chars. Use filter/limit to narrow results.]";
-            }
+            $content = self::truncateToolResult($content, $this->maxResultLength);
 
             return [
                 'content'    => $content,
@@ -223,6 +282,48 @@ class ChatOrchestrator
                 'latency_ms' => $latencyMs,
             ];
         }
+    }
+
+    /**
+     * Dispatch a data-service tool call. Errors propagate; the executeTool
+     * caller catches them and surfaces them to the AI as tool results.
+     */
+    private function dispatchDataTool(array $toolCall): array
+    {
+        [$serviceName, $toolName] = ToolRegistry::parseToolName($toolCall['name']);
+        return $this->toolClient->executeTool($serviceName, $toolName, $toolCall['arguments'] ?? []);
+    }
+
+    /**
+     * Dispatch an MCP-service tool call via JSON-RPC. The orchestrator
+     * routes here when the tool name starts with the `mcp_` family
+     * prefix that ToolRegistry::buildMcpServiceTools() emits.
+     */
+    private function dispatchMcpTool(array $toolCall): array
+    {
+        if ($this->mcpClient === null) {
+            throw new ChatException(
+                'MCP tool dispatched but no McpToolClient was attached to this orchestrator.'
+            );
+        }
+
+        [$prefix, $toolName] = ToolRegistry::parseToolName($toolCall['name']);
+        $svcName = ToolRegistry::unwrapMcpServiceName($prefix);
+        return $this->mcpClient->callTool($svcName, $toolName, $toolCall['arguments'] ?? []);
+    }
+
+    /**
+     * Cap a JSON-serialized tool result so it can't blow the AI's context
+     * window. When truncated, an explicit marker is appended so the AI knows
+     * to narrow its query rather than hallucinate continuation.
+     */
+    public static function truncateToolResult(string $content, int $maxLength): string
+    {
+        if ($maxLength <= 0 || strlen($content) <= $maxLength) {
+            return $content;
+        }
+        return substr($content, 0, $maxLength)
+            . "\n...[TRUNCATED at {$maxLength} chars. Use filter/limit to narrow results.]";
     }
 
     // ────────────────────────────────────────────────────────
