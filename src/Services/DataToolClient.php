@@ -43,7 +43,7 @@ class DataToolClient
         private readonly ?string $apiKey = null,
     ) {
         $this->baseApiUrl = rtrim(
-            config('ai-chat.internal_api_url') ?? url('/api/v2'),
+            self::resolveInternalApiUrl(),
             '/',
         );
 
@@ -171,6 +171,27 @@ class DataToolClient
     // ────────────────────────────────────────────────────────
     // Internal HTTP helper
     // ────────────────────────────────────────────────────────
+
+    /**
+     * Resolve the base URL the tool client uses to call DreamFactory back.
+     *
+     * Priority:
+     *   1. AI_CHAT_INTERNAL_API_URL (env / `ai-chat.internal_api_url` config)
+     *      — explicit override for unusual deployments
+     *   2. http://localhost/api/v2 — the same-container loopback that
+     *      works in the standard docker-compose setup. The PHP-FPM
+     *      container bundles nginx on :80 internally; outbound :8080 is
+     *      only the host-port mapping. We can't use Laravel's url()
+     *      helper because its APP_URL is typically the external hostname.
+     */
+    public static function resolveInternalApiUrl(): string
+    {
+        $configured = config('ai-chat.internal_api_url');
+        if (is_string($configured) && $configured !== '') {
+            return $configured;
+        }
+        return 'http://localhost/api/v2';
+    }
 
     private function request(string $method, string $uri, array $options = []): array
     {
