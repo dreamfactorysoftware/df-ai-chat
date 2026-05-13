@@ -20,6 +20,24 @@ class DataToolClient
     private Client $client;
     private string $baseApiUrl;
 
+    /** Allowed shape for a DreamFactory service name. */
+    private const SERVICE_NAME_PATTERN = '/^[A-Za-z0-9_-]+$/';
+
+    /**
+     * Reject any $serviceName that could traverse out of the intended
+     * service path or smuggle URL syntax (slash, query, fragment, scheme).
+     *
+     * @throws \InvalidArgumentException when the name fails the allowlist.
+     */
+    public static function validateServiceName(string $serviceName): void
+    {
+        if ($serviceName === '' || preg_match(self::SERVICE_NAME_PATTERN, $serviceName) !== 1) {
+            throw new \InvalidArgumentException(
+                'Invalid DreamFactory service name; must match [A-Za-z0-9_-]+'
+            );
+        }
+    }
+
     public function __construct(
         private readonly string $sessionToken,
         private readonly ?string $apiKey = null,
@@ -46,21 +64,25 @@ class DataToolClient
 
     public function getTables(string $serviceName): array
     {
+        self::validateServiceName($serviceName);
         return $this->request('GET', "/{$serviceName}/_schema");
     }
 
     public function getTableSchema(string $serviceName, string $tableName): array
     {
+        self::validateServiceName($serviceName);
         return $this->request('GET', "/{$serviceName}/_schema/" . urlencode($tableName));
     }
 
     public function getTableFields(string $serviceName, string $tableName): array
     {
+        self::validateServiceName($serviceName);
         return $this->request('GET', "/{$serviceName}/_schema/" . urlencode($tableName) . "/_field");
     }
 
     public function getTableRelationships(string $serviceName, string $tableName): array
     {
+        self::validateServiceName($serviceName);
         return $this->request('GET', "/{$serviceName}/_schema/" . urlencode($tableName) . "/_related");
     }
 
@@ -70,6 +92,7 @@ class DataToolClient
 
     public function getTableData(string $serviceName, string $tableName, array $options = []): array
     {
+        self::validateServiceName($serviceName);
         $query = [];
         foreach (['fields', 'filter', 'limit', 'offset', 'order', 'group', 'related'] as $key) {
             if (isset($options[$key]) && $options[$key] !== '' && $options[$key] !== null) {
@@ -94,11 +117,13 @@ class DataToolClient
 
     public function getStoredProcedures(string $serviceName): array
     {
+        self::validateServiceName($serviceName);
         return $this->request('GET', "/{$serviceName}/_proc");
     }
 
     public function callStoredProcedure(string $serviceName, string $name, ?array $params = null): array
     {
+        self::validateServiceName($serviceName);
         return $this->request('POST', "/{$serviceName}/_proc/" . urlencode($name), [
             'json' => $params ?? [],
         ]);
@@ -106,11 +131,13 @@ class DataToolClient
 
     public function getStoredFunctions(string $serviceName): array
     {
+        self::validateServiceName($serviceName);
         return $this->request('GET', "/{$serviceName}/_func");
     }
 
     public function callStoredFunction(string $serviceName, string $name, ?array $params = null): array
     {
+        self::validateServiceName($serviceName);
         return $this->request('POST', "/{$serviceName}/_func/" . urlencode($name), [
             'json' => $params ?? [],
         ]);
