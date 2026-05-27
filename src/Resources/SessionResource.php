@@ -10,19 +10,25 @@ use DreamFactory\Core\AIChat\Exceptions\ChatException;
 use DreamFactory\Core\AIChat\Models\AiChatConfig;
 use DreamFactory\Core\AIChat\Models\AiChatMessage;
 use DreamFactory\Core\AIChat\Models\AiChatSession;
+use DreamFactory\Core\AIChat\Services\AiAgentCredentials;
 use DreamFactory\Core\AIChat\Services\ChatOrchestrator;
 use DreamFactory\Core\AIChat\Services\DataToolClient;
+use DreamFactory\Core\AIChat\Services\McpToolClient;
 use DreamFactory\Core\AIChat\Services\ToolRegistry;
 use DreamFactory\Core\Enums\ServiceRequestorTypes;
 use DreamFactory\Core\Exceptions\BadRequestException;
 use DreamFactory\Core\Exceptions\ForbiddenException;
 use DreamFactory\Core\Exceptions\NotFoundException;
+use DreamFactory\Core\Models\App;
+use DreamFactory\Core\Models\RoleServiceAccess;
+use DreamFactory\Core\Models\Service;
 use DreamFactory\Core\Models\User;
 use DreamFactory\Core\Models\UserAppRole;
 use DreamFactory\Core\Resources\BaseRestResource;
 use DreamFactory\Core\Utility\JWTUtilities;
 use DreamFactory\Core\Utility\Session;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 
 class SessionResource extends BaseRestResource
 {
@@ -68,7 +74,13 @@ class SessionResource extends BaseRestResource
     {
         $session = $this->findSession($sessionId, $userId);
 
-        $limit = (int) $this->request->getParameter('message_limit', 50);
+        // Clamp upper bound — caller-supplied values were previously cast
+        // to int but never bounded, so `?message_limit=10000000` would
+        // materialize ten million rows. The hard upper bound is sourced
+        // from config so deployments with legitimate large-history needs
+        // can raise it without patching code.
+        $hardMax = (int) config('ai-chat.message_limit_max', 500);
+        $limit = max(1, min($hardMax, (int) $this->request->getParameter('message_limit', 50)));
         $messages = AiChatMessage::where('session_id', $session->id)
             ->orderBy('created_at', 'desc')
             ->orderBy('id', 'desc')
@@ -108,7 +120,10 @@ class SessionResource extends BaseRestResource
         $service = $this->getService();
         $serviceConfig = $service->getConfig();
 
-        // Resolve AI service configuration.
+        // Resolve AI service configuration. The two REQUIRED knobs:
+        //   ai_service_id  — which AI Connection (Anthropic / OpenAI / etc.)
+        //   ai_role_id     — the DreamFactory role the AI operates under
+        //                    (the only access bottleneck for tool calls)
         $aiServiceId = (int) ($payload['ai_service_id']
             ?? $serviceConfig['ai_service_id']
             ?? 0);
@@ -123,25 +138,22 @@ class SessionResource extends BaseRestResource
             throw new BadRequestException('AI role is not configured. Set ai_role_id in the service config or request payload.');
         }
 
-        // Resolve data services.
-        $dataServices = $payload['data_services'] ?? null;
-        if ($dataServices === null) {
-            $defaults = $serviceConfig['default_data_services'] ?? null;
-            if (is_string($defaults)) {
-                $dataServices = json_decode($defaults, true);
-            } elseif (is_array($defaults)) {
-                $dataServices = $defaults;
-            }
-        }
-
-        if (empty($dataServices) || !is_array($dataServices)) {
-            throw new BadRequestException('data_services must be a non-empty array of DreamFactory service names.');
-        }
-
-        $allowedResources = $payload['allowed_resources'] ?? null;
-
         // ── Security validation ──
-        $this->validateSessionCreation($aiServiceId, $aiRoleId, $dataServices, $allowedResources);
+        // The AI role must be in the AI Connection's allowed_roles list.
+        // No more parallel data_services / allowed_resources allow-lists —
+        // the role's own service_access grants are what gate tool calls,
+        // enforced at the wire by DreamFactory's standard RBAC pipeline.
+        $this->validateAiRoleAllowed($aiServiceId, $aiRoleId);
+
+        // Optional override surface — admins or session-creating SDKs can
+        // STILL pass narrowed `data_services` / `allowed_resources` if they
+        // want to scope a single session tighter than the role allows.
+        // Empty/null means "use everything the role can read" (the default).
+        $dataServices = $payload['data_services'] ?? null;
+        if (!is_array($dataServices) || empty($dataServices)) {
+            $dataServices = null; // sentinel: "no override, derive from role"
+        }
+        $allowedResources = $payload['allowed_resources'] ?? null;
 
         // Create the session.
         $session = AiChatSession::create([
@@ -150,6 +162,11 @@ class SessionResource extends BaseRestResource
             'user_id'           => $userId,
             'user_role_id'      => Session::getRoleId(),
             'ai_role_id'        => $aiRoleId,
+            // data_services on the session is now an OVERRIDE only. When
+            // null/empty, sendMessage() derives the tool surface from the
+            // role's service_access. We persist the override so a session
+            // started with a narrowed scope keeps that scope on follow-up
+            // messages, even if the role's access changes mid-session.
             'data_services'     => $dataServices,
             'allowed_resources' => $allowedResources,
             'title'             => $payload['title'] ?? null,
@@ -186,13 +203,26 @@ class SessionResource extends BaseRestResource
             throw new ChatException("Session message limit ({$maxMessages}) reached.");
         }
 
-        // Build the orchestrator.
+        // Build the orchestrator. The AI agent's credentials (JWT + the
+        // role-bound app's API key) are auto-provisioned on first use,
+        // then the same row is reused for the lifetime of the role.
         $provider = AiProviderFactory::fromServiceId($session->ai_service_id);
-        $aiToken = $this->generateAiToken($session->ai_role_id);
-        $toolClient = new DataToolClient($aiToken);
-        $tools = ToolRegistry::build($session->data_services, $session->allowed_resources);
+        $creds = AiAgentCredentials::resolve($session->ai_role_id);
+        $toolClient = new DataToolClient($creds['token'], $creds['api_key']);
+        $mcpClient  = new McpToolClient($creds['token'], $creds['api_key']);
 
-        $orchestrator = new ChatOrchestrator($provider, $toolClient, $tools, $session);
+        // Tool surface is driven by the role's own service_access grants —
+        // every data + MCP service the role can read becomes a tool the
+        // AI sees. If a session was created with a narrower override
+        // (`data_services` set), respect it — the override is enforced
+        // server-side by RBAC anyway, this just keeps the AI from
+        // wasting tool-call iterations on resources it can't reach.
+        $tools = ToolRegistry::buildFromRole($session->ai_role_id, $mcpClient);
+        if (is_array($session->data_services) && !empty($session->data_services)) {
+            $tools = self::filterToolsByOverride($tools, $session->data_services);
+        }
+
+        $orchestrator = new ChatOrchestrator($provider, $toolClient, $tools, $session, $mcpClient);
 
         try {
             $result = $orchestrator->sendMessage(trim($message));
@@ -242,71 +272,66 @@ class SessionResource extends BaseRestResource
     // ────────────────────────────────────────────────────────
 
     /**
-     * Validate that the current user is allowed to create a session
-     * with the given AI service and data services.
+     * Validate that the AI role is allowed to operate under the given
+     * AI Connection — i.e. the role appears in the AI Connection's
+     * `allowed_roles` list. This is the ONLY pre-creation check; the
+     * actual tool-call RBAC happens at the wire on every dispatch.
      *
      * @throws ForbiddenException
-     * @throws BadRequestException
      */
-    private function validateSessionCreation(
-        int $aiServiceId,
-        int $aiRoleId,
-        array $dataServices,
-        ?array $allowedResources,
-    ): void {
-        // 1. Check the AI role is in the AI service's allowed_roles.
-        //    allowed_roles restricts which DreamFactory roles the AI can operate under.
-        //    Policy: empty allowed_roles means NO roles are permitted (restrictive default).
+    private function validateAiRoleAllowed(int $aiServiceId, int $aiRoleId): void
+    {
         $aiConfig = AiConnectionConfig::whereServiceId($aiServiceId)->first();
-        if ($aiConfig) {
-            $allowedRoles = $aiConfig->allowed_roles;
-            if (is_string($allowedRoles)) {
-                $allowedRoles = json_decode($allowedRoles, true);
-            }
-            if (empty($allowedRoles) || !is_array($allowedRoles)) {
-                throw new ForbiddenException(
-                    'No roles are configured for this AI service. An admin must assign allowed roles before the AI can access data.'
-                );
-            }
-            if (!in_array($aiRoleId, $allowedRoles, false)) {
-                throw new ForbiddenException(
-                    "The AI role (ID: {$aiRoleId}) is not in this AI service's allowed roles."
-                );
-            }
+        if (!$aiConfig) {
+            return; // No config row yet — nothing to validate against.
         }
 
-        // 2. Validate user has read access to each requested data service.
-        $requestorType = ServiceRequestorTypes::API;
-        foreach ($dataServices as $svcName) {
-            if (!is_string($svcName) || trim($svcName) === '') {
-                throw new BadRequestException('Each data_services entry must be a non-empty string.');
-            }
-            Session::checkServicePermission('GET', $svcName, null, $requestorType);
+        $allowedRoles = $aiConfig->allowed_roles;
+        if (is_string($allowedRoles)) {
+            $allowedRoles = json_decode($allowedRoles, true);
         }
+        if (empty($allowedRoles) || !is_array($allowedRoles)) {
+            throw new ForbiddenException(
+                'No roles are configured for this AI Connection. An admin must add roles to its "Allowed Roles" list before chats can use it.'
+            );
+        }
+        // Normalize to ints so admin configs that stored role IDs as JSON
+        // strings still match the int $aiRoleId under strict comparison.
+        $allowedRoles = array_map('intval', $allowedRoles);
+        if (!in_array($aiRoleId, $allowedRoles, true)) {
+            throw new ForbiddenException(
+                "The AI role (ID: {$aiRoleId}) is not in this AI Connection's allowed roles. "
+                . 'Add it via the AI Connection edit page → "Allowed Roles".'
+            );
+        }
+    }
 
-        // 3. Validate allowed_resources tables are within user's access.
-        if (!empty($allowedResources) && is_array($allowedResources)) {
-            foreach ($allowedResources as $svcName => $tables) {
-                if (!in_array($svcName, $dataServices, true)) {
-                    throw new BadRequestException(
-                        "allowed_resources references service '{$svcName}' which is not in data_services."
-                    );
-                }
-                if (!is_array($tables)) {
-                    throw new BadRequestException(
-                        "allowed_resources['{$svcName}'] must be an array of table names."
-                    );
-                }
-                foreach ($tables as $table) {
-                    Session::checkServicePermission(
-                        'GET',
-                        $svcName,
-                        "_table/{$table}",
-                        $requestorType,
-                    );
-                }
-            }
-        }
+    /**
+     * Apply a per-session `data_services` override on top of role-derived
+     * tools. Keeps only tools whose service portion is in the override
+     * list. The override is also enforced at the wire by RBAC (the role
+     * is the bottleneck), so this is a UX optimization — stops the AI
+     * from wasting tool-call iterations on services the session was
+     * deliberately scoped away from.
+     *
+     * Note: MCP tools use `mcp_<svc>` as their service prefix, so to keep
+     * MCP services in scope when overriding data services, the override
+     * list must include the full `mcp_<svc>` form. By default (no
+     * override) MCP tools are always surfaced when the role grants access.
+     *
+     * @param \DreamFactory\Core\AI\Providers\ToolDefinition[] $tools
+     * @param string[] $allowed
+     * @return \DreamFactory\Core\AI\Providers\ToolDefinition[]
+     */
+    private static function filterToolsByOverride(array $tools, array $allowed): array
+    {
+        return array_values(array_filter(
+            $tools,
+            function ($tool) use ($allowed) {
+                [$svc] = ToolRegistry::parseToolName($tool->name);
+                return in_array($svc, $allowed, true);
+            },
+        ));
     }
 
     // ────────────────────────────────────────────────────────
@@ -335,36 +360,6 @@ class SessionResource extends BaseRestResource
         }
 
         return $session;
-    }
-
-    /**
-     * Generate a JWT token for the AI role.
-     *
-     * Finds a user assigned to the AI role and creates a session token
-     * that carries that role's restricted permissions.
-     *
-     * @throws ChatException
-     */
-    private function generateAiToken(int $aiRoleId): string
-    {
-        // Find a user assigned to this role.
-        $userAppRole = UserAppRole::where('role_id', $aiRoleId)->first();
-
-        if (!$userAppRole) {
-            throw new ChatException(
-                "No user is assigned to AI role ID {$aiRoleId}. "
-                . 'Create a dedicated user and assign it the AI role.'
-            );
-        }
-
-        $user = User::find($userAppRole->user_id);
-        if (!$user) {
-            throw new ChatException(
-                "User ID {$userAppRole->user_id} for AI role not found."
-            );
-        }
-
-        return JWTUtilities::makeJWTByUser($user->id, $user->email);
     }
 
     // ────────────────────────────────────────────────────────
