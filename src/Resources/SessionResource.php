@@ -131,6 +131,26 @@ class SessionResource extends BaseRestResource
             ?? $serviceConfig['ai_role_id']
             ?? 0);
 
+        // ── V1 role binding (server-side, non-admin) ──
+        // A non-admin may NOT choose which role the AI operates under: the
+        // AI role is bound to the caller's own login role. Without this, any
+        // non-admin could pass an `ai_role_id` for any role in the
+        // connection's allowed_roles and inherit that role's full tool
+        // surface — row filters, table grants and all — a straight privilege
+        // escalation. The separate ai_role_id stays a real knob for admins
+        // and service config (least-privilege: scope the AI narrower than the
+        // human), but a non-admin's request body can never widen it past
+        // their own role.
+        if (!Session::isSysAdmin()) {
+            $callerRoleId = (int) Session::getRoleId();
+            if ($callerRoleId <= 0) {
+                throw new ForbiddenException(
+                    'Your account has no role assigned, so an AI chat role cannot be derived. Contact an administrator.'
+                );
+            }
+            $aiRoleId = $callerRoleId;
+        }
+
         if ($aiServiceId === 0) {
             throw new BadRequestException('AI service is not configured. Set ai_service_id in the service config or request payload.');
         }
