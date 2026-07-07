@@ -120,42 +120,45 @@ class SessionResource extends BaseRestResource
         $service = $this->getService();
         $serviceConfig = $service->getConfig();
 
-        // Resolve AI service configuration. The two REQUIRED knobs:
-        //   ai_service_id  — which AI Connection (Anthropic / OpenAI / etc.)
-        //   ai_role_id     — the DreamFactory role the AI operates under
-        //                    (the only access bottleneck for tool calls)
+        // ── Which model ──
+        // ai_service_id picks the AI Connection (provider + model). Required.
         $aiServiceId = (int) ($payload['ai_service_id']
             ?? $serviceConfig['ai_service_id']
             ?? 0);
-        $aiRoleId = (int) ($payload['ai_role_id']
-            ?? $serviceConfig['ai_role_id']
-            ?? 0);
-
-        // ── V1 role binding (server-side, non-admin) ──
-        // A non-admin may NOT choose which role the AI operates under: the
-        // AI role is bound to the caller's own login role. Without this, any
-        // non-admin could pass an `ai_role_id` for any role in the
-        // connection's allowed_roles and inherit that role's full tool
-        // surface — row filters, table grants and all — a straight privilege
-        // escalation. The separate ai_role_id stays a real knob for admins
-        // and service config (least-privilege: scope the AI narrower than the
-        // human), but a non-admin's request body can never widen it past
-        // their own role.
-        if (!Session::isSysAdmin()) {
-            $callerRoleId = (int) Session::getRoleId();
-            if ($callerRoleId <= 0) {
-                throw new ForbiddenException(
-                    'Your account has no role assigned, so an AI chat role cannot be derived. Contact an administrator.'
-                );
-            }
-            $aiRoleId = $callerRoleId;
-        }
-
         if ($aiServiceId === 0) {
             throw new BadRequestException('AI service is not configured. Set ai_service_id in the service config or request payload.');
         }
+
+        // ── Which role (the security boundary) ──
+        // A conversation runs under the CALLER's own role — so the AI can
+        // never see more than the person talking to it. End users cannot
+        // widen or override it. Only a role-less caller (a sysadmin, or a
+        // server-to-server API key) falls back to the conversation's
+        // configured fallback role (ai_role_id).
+        $callerRoleId = (int) Session::getRoleId();
+        if (!Session::isSysAdmin()) {
+            // End users are locked to their own login role — they can never
+            // widen it, and a request-supplied ai_role_id is ignored.
+            if ($callerRoleId <= 0) {
+                throw new ForbiddenException(
+                    'Your account has no role assigned, so an AI chat cannot be started. Contact an administrator.'
+                );
+            }
+            $aiRoleId = $callerRoleId;
+        } else {
+            // Admins may "act as" any role — down-scoping is never an
+            // escalation. Precedence: the explicit act-as role on the request,
+            // then the admin's own role (if any), then the service's headless
+            // fallback role.
+            $aiRoleId = (int) ($payload['ai_role_id']
+                ?? ($callerRoleId > 0 ? $callerRoleId : null)
+                ?? $serviceConfig['ai_role_id']
+                ?? 0);
+        }
         if ($aiRoleId === 0) {
-            throw new BadRequestException('AI role is not configured. Set ai_role_id in the service config or request payload.');
+            throw new BadRequestException(
+                'No role is available for this chat. Sign in as a user with a role, or set a fallback role on the AI Chat service.'
+            );
         }
 
         // ── Security validation ──
@@ -165,14 +168,17 @@ class SessionResource extends BaseRestResource
         // enforced at the wire by DreamFactory's standard RBAC pipeline.
         $this->validateAiRoleAllowed($aiServiceId, $aiRoleId);
 
-        // Optional override surface — admins or session-creating SDKs can
-        // STILL pass narrowed `data_services` / `allowed_resources` if they
-        // want to scope a single session tighter than the role allows.
-        // Empty/null means "use everything the role can read" (the default).
-        $dataServices = $payload['data_services'] ?? null;
-        if (!is_array($dataServices) || empty($dataServices)) {
-            $dataServices = null; // sentinel: "no override, derive from role"
-        }
+        // Capability scope for this conversation. Both are optional narrowing
+        // lists — resolved from the request, falling back to the service
+        // config. Null/empty means "everything the role grants" for that
+        // dimension. The AI always sees the INTERSECTION of these lists and
+        // the caller's role: they can only narrow, never widen.
+        $dataServices = self::normalizeScopeList(
+            $payload['data_services'] ?? $serviceConfig['default_data_services'] ?? null
+        );
+        $mcpServers = self::normalizeScopeList(
+            $payload['mcp_servers'] ?? $serviceConfig['mcp_servers'] ?? null
+        );
         $allowedResources = $payload['allowed_resources'] ?? null;
 
         // Create the session.
@@ -188,6 +194,7 @@ class SessionResource extends BaseRestResource
             // started with a narrowed scope keeps that scope on follow-up
             // messages, even if the role's access changes mid-session.
             'data_services'     => $dataServices,
+            'mcp_servers'       => $mcpServers,
             'allowed_resources' => $allowedResources,
             'title'             => $payload['title'] ?? null,
             'system_prompt'     => $payload['system_prompt'] ?? $serviceConfig['system_prompt'] ?? null,
@@ -240,6 +247,12 @@ class SessionResource extends BaseRestResource
         $tools = ToolRegistry::buildFromRole($session->ai_role_id, $mcpClient);
         if (is_array($session->data_services) && !empty($session->data_services)) {
             $tools = self::filterToolsByOverride($tools, $session->data_services);
+        }
+        // Explicit MCP scope: when the conversation names its MCP server(s),
+        // drop MCP tools from any server not on the list. Data tools are
+        // untouched. Empty/null means "every MCP server the role grants".
+        if (is_array($session->mcp_servers) && !empty($session->mcp_servers)) {
+            $tools = self::filterMcpToolsByScope($tools, $session->mcp_servers);
         }
 
         $orchestrator = new ChatOrchestrator($provider, $toolClient, $tools, $session, $mcpClient);
@@ -352,6 +365,57 @@ class SessionResource extends BaseRestResource
                 return in_array($svc, $allowed, true);
             },
         ));
+    }
+
+    /**
+     * Keep only MCP tools whose underlying MCP service is in the
+     * conversation's `mcp_servers` scope. Non-MCP (data) tools pass through
+     * untouched. Like the data override, the caller's role is still the
+     * hard bottleneck at the wire — this just stops the AI from being
+     * offered MCP tools the conversation was deliberately scoped away from.
+     *
+     * @param \DreamFactory\Core\AI\Providers\ToolDefinition[] $tools
+     * @param string[] $allowedMcp  MCP service names (unprefixed)
+     * @return \DreamFactory\Core\AI\Providers\ToolDefinition[]
+     */
+    private static function filterMcpToolsByScope(array $tools, array $allowedMcp): array
+    {
+        return array_values(array_filter(
+            $tools,
+            function ($tool) use ($allowedMcp) {
+                if (!ToolRegistry::isMcpTool($tool->name)) {
+                    return true; // data tools are unaffected by MCP scope
+                }
+                [$svc] = ToolRegistry::parseToolName($tool->name);
+                $mcpService = ToolRegistry::unwrapMcpServiceName($svc);
+                return in_array($mcpService, $allowedMcp, true);
+            },
+        ));
+    }
+
+    /**
+     * Normalize a scope list (data services or MCP servers) coming from a
+     * request payload or a service-config field. Accepts a real array or a
+     * JSON-encoded string. Returns a clean list of non-empty string names,
+     * or null when there is no usable scope (the "no narrowing" sentinel).
+     *
+     * @param mixed $value
+     * @return string[]|null
+     */
+    private static function normalizeScopeList($value): ?array
+    {
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            $value = is_array($decoded) ? $decoded : null;
+        }
+        if (!is_array($value) || empty($value)) {
+            return null;
+        }
+        $clean = array_values(array_filter(
+            array_map(fn ($v) => is_string($v) ? trim($v) : '', $value),
+            fn ($v) => $v !== '',
+        ));
+        return empty($clean) ? null : $clean;
     }
 
     // ────────────────────────────────────────────────────────
@@ -553,13 +617,18 @@ class SessionResource extends BaseRestResource
         return [
             'CreateSessionRequest' => [
                 'type'     => 'object',
-                'required' => ['data_services'],
                 'properties' => [
                     'data_services' => [
                         'type'        => 'array',
                         'items'       => ['type' => 'string'],
-                        'description' => 'DreamFactory service names the AI can access.',
+                        'description' => 'Optional. Data service names this conversation may query; intersected with the caller\'s role. Omit to use every data service the role grants.',
                         'example'     => ['dellstore_db', 'hr_db'],
+                    ],
+                    'mcp_servers' => [
+                        'type'        => 'array',
+                        'items'       => ['type' => 'string'],
+                        'description' => 'Optional. MCP service names this conversation may call as tools; intersected with the caller\'s role. Omit to use every MCP server the role grants.',
+                        'example'     => ['sysco_mcp'],
                     ],
                     'allowed_resources' => [
                         'type'        => 'object',
@@ -594,6 +663,7 @@ class SessionResource extends BaseRestResource
                     'service_id'          => ['type' => 'integer'],
                     'user_id'             => ['type' => 'integer'],
                     'data_services'       => ['type' => 'array', 'items' => ['type' => 'string']],
+                    'mcp_servers'         => ['type' => 'array', 'items' => ['type' => 'string']],
                     'allowed_resources'   => ['type' => 'object'],
                     'title'               => ['type' => 'string'],
                     'status'              => ['type' => 'string'],

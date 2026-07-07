@@ -336,12 +336,86 @@ class ToolRegistry
             $tools[] = new ToolDefinition(
                 name: "mcp_{$svc}__" . $raw['name'],
                 description: (string) ($raw['description'] ?? "MCP tool '{$raw['name']}' on service '{$svc}'."),
-                parameters: is_array($raw['inputSchema'] ?? null)
-                    ? $raw['inputSchema']
-                    : ['type' => 'object', 'properties' => new \stdClass(), 'required' => []],
+                parameters: self::normalizeInputSchema($raw['inputSchema'] ?? null),
             );
         }
         return $tools;
+    }
+
+    /**
+     * Normalize an MCP tool's inputSchema into a JSON-schema shape the LLM
+     * providers accept. Critically, an empty `properties` must serialize as an
+     * object ({}) not an array ([]): PHP's associative json_decode turns {}
+     * into [] upstream in McpToolClient, and Anthropic rejects
+     * `input_schema.properties: []`.
+     *
+     * @param mixed $schema
+     * @return array
+     */
+    private static function normalizeInputSchema($schema): array
+    {
+        if (!is_array($schema)) {
+            return ['type' => 'object', 'properties' => new \stdClass(), 'required' => []];
+        }
+        $schema = self::sanitizeSchemaNode($schema);
+        $schema['type'] = $schema['type'] ?? 'object';
+        if (!isset($schema['properties'])) {
+            $schema['properties'] = new \stdClass();
+        }
+        return $schema;
+    }
+
+    /**
+     * Recursively coerce an MCP-supplied JSON schema into what the LLM
+     * providers accept: drop the `$schema` dialect marker (MCP emits draft-07,
+     * Anthropic wants draft 2020-12 and rejects the explicit declaration), and
+     * turn every empty `properties` map into an object ({}) rather than the
+     * array ([]) that PHP's associative json_decode produces.
+     */
+    private static function sanitizeSchemaNode(array $node): array
+    {
+        unset($node['$schema']);
+
+        // Maps-of-schemas: an empty {} decodes to [] in PHP and must be
+        // restored to an object; non-empty maps recurse into their schema
+        // values.
+        foreach (['properties', 'patternProperties', '$defs', 'definitions'] as $mapKey) {
+            if (!array_key_exists($mapKey, $node)) {
+                continue;
+            }
+            if (!is_array($node[$mapKey]) || $node[$mapKey] === []) {
+                $node[$mapKey] = new \stdClass();
+                continue;
+            }
+            $clean = [];
+            foreach ($node[$mapKey] as $name => $sub) {
+                $clean[$name] = is_array($sub) ? self::sanitizeSchemaNode($sub) : $sub;
+            }
+            $node[$mapKey] = (object) $clean;
+        }
+
+        // additionalProperties: a boolean or a schema. An empty [] is a
+        // mangled {} (permissive) — restore it; a real schema recurses.
+        if (array_key_exists('additionalProperties', $node) && is_array($node['additionalProperties'])) {
+            $node['additionalProperties'] = $node['additionalProperties'] === []
+                ? new \stdClass()
+                : self::sanitizeSchemaNode($node['additionalProperties']);
+        }
+
+        // items + combinators: single schema or arrays of schemas.
+        if (isset($node['items']) && is_array($node['items'])) {
+            $node['items'] = self::sanitizeSchemaNode($node['items']);
+        }
+        foreach (['allOf', 'anyOf', 'oneOf'] as $comb) {
+            if (isset($node[$comb]) && is_array($node[$comb])) {
+                $node[$comb] = array_map(
+                    fn ($s) => is_array($s) ? self::sanitizeSchemaNode($s) : $s,
+                    $node[$comb],
+                );
+            }
+        }
+
+        return $node;
     }
 
     /**
