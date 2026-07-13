@@ -197,7 +197,19 @@ class DataToolClient
     {
         try {
             $response = $this->client->request($method, $this->baseApiUrl . $uri, $options);
-            $body = json_decode($response->getBody()->getContents(), true);
+            $raw = $response->getBody()->getContents();
+            $body = json_decode($raw, true);
+            if (!is_array($body)) {
+                // Some PHP 8.5 setups leak deprecation/notice HTML ahead of the
+                // JSON body (e.g. PDO::MYSQL_ATTR_SSL_CA). A raw decode of the
+                // polluted string yields null, which would silently turn every
+                // tool result into an empty array. Recover by decoding from the
+                // first JSON delimiter — the same defense the chat app applies.
+                $start = strcspn($raw, '{[');
+                if ($start < strlen($raw)) {
+                    $body = json_decode(substr($raw, $start), true);
+                }
+            }
             return is_array($body) ? $body : [];
         } catch (GuzzleException $e) {
             throw new ChatException(

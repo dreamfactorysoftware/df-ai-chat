@@ -41,15 +41,26 @@ class ToolRegistry
     private static function buildServiceTools(string $svc, ?array $tables): array
     {
         $tableNote = $tables !== null
-            ? ' Allowed tables: ' . implode(', ', $tables) . '.'
+            ? ' Allowed tables: ' . implode(', ', $tables) . '. Query these by name directly.'
             : '';
 
-        return [
-            new ToolDefinition(
+        $defs = [];
+
+        // Only advertise table discovery when the role has unrestricted
+        // table access. When the role grants specific tables, listing all
+        // tables (a) is denied by RBAC and returns empty — which reads to the
+        // LLM as "no data" — and (b) would leak the names of tables the role
+        // deliberately cannot see (e.g. payroll). Instead the allowed names
+        // are baked into every tool's description via $tableNote.
+        if ($tables === null) {
+            $defs[] = new ToolDefinition(
                 name: "{$svc}__get_tables",
                 description: "List all tables available in the '{$svc}' database service.",
                 parameters: ['type' => 'object', 'properties' => new \stdClass(), 'required' => []],
-            ),
+            );
+        }
+
+        return array_merge($defs, [
             new ToolDefinition(
                 name: "{$svc}__get_table_schema",
                 description: "Get the full schema (columns, types, keys) for a table in '{$svc}'.{$tableNote}",
@@ -102,7 +113,7 @@ class ToolRegistry
                     'required' => ['tableName'],
                 ],
             ),
-        ];
+        ]);
     }
 
     /**
@@ -146,14 +157,73 @@ class ToolRegistry
             return [];
         }
 
+        $allowedTables = self::allowedTablesByService($roleId);
+
         $tools = [];
         foreach ($services as $svc) {
+            // null => role has unrestricted table access on this service;
+            // an array => only those tables are reachable, so scope the
+            // tool surface to them (and drop the table-listing tool).
+            $tables = $allowedTables[$svc->id] ?? null;
             $tools = array_merge(
                 $tools,
-                self::toolsForService($svc, $mcpClient),
+                self::toolsForService($svc, $mcpClient, $tables),
             );
         }
         return $tools;
+    }
+
+    /**
+     * Map each service id the role touches to the set of table names its
+     * grants allow, or null when the role has unrestricted table access on
+     * that service (a wildcard component, or a service-level `*` grant).
+     *
+     * This is what makes the tool surface honestly reflect the row of RBAC
+     * beneath it: a role granted only `_table/customers/*` and
+     * `_table/orders/*` on a database gets tools scoped to exactly those two
+     * tables — the LLM never even sees a handle for anything else.
+     *
+     * @return array<int, string[]|null>
+     */
+    private static function allowedTablesByService(int $roleId): array
+    {
+        $map = [];
+        foreach (RoleServiceAccess::where('role_id', $roleId)->get() as $row) {
+            $svcId = (int) $row->service_id;
+            if ($svcId <= 0) {
+                continue; // wildcard-service rows don't scope tables
+            }
+            $component = (string) $row->component;
+
+            // A grant that targets a specific table via either the data
+            // (`_table/<name>`) or schema (`_schema/<name>`) verb scopes the
+            // surface to that table. The name may be dataset-qualified
+            // (`sysco.customers`) — capture up to the next `/` or `*`.
+            if (preg_match('#^_(?:table|schema)/([^/*]+)#', $component, $m)) {
+                if (array_key_exists($svcId, $map) && $map[$svcId] === null) {
+                    continue; // a prior unrestricted mark wins
+                }
+                $map[$svcId][] = $m[1];
+                continue;
+            }
+
+            // Broad grants (`*`, `_table`, `_table/*`, `_schema`, `_schema/*`)
+            // give access to every table — mark the service unrestricted.
+            if (preg_match('#^(\*|_table(/\*)?|_schema(/\*)?)$#', $component)) {
+                $map[$svcId] = null;
+                continue;
+            }
+
+            // Any other component (stored procs, functions, ...) neither
+            // scopes to a table nor widens table access — ignore it.
+        }
+        // De-dupe table names.
+        foreach ($map as $svcId => $tables) {
+            if (is_array($tables)) {
+                $map[$svcId] = array_values(array_unique($tables));
+            }
+        }
+        return $map;
     }
 
     /**
@@ -223,7 +293,7 @@ class ToolRegistry
      *
      * @return ToolDefinition[]
      */
-    private static function toolsForService(Service $service, ?McpToolClient $mcpClient): array
+    private static function toolsForService(Service $service, ?McpToolClient $mcpClient, ?array $tables = null): array
     {
         if ($service->type === 'mcp') {
             return $mcpClient !== null
@@ -233,8 +303,9 @@ class ToolRegistry
 
         // Default: assume it's a data service. Data tools work for any
         // service that exposes the standard /_table and /_schema verbs
-        // (SQL, NoSQL, custom database services).
-        return self::buildServiceTools($service->name, null);
+        // (SQL, NoSQL, custom database services). $tables scopes the surface
+        // to the role's granted tables (null = unrestricted).
+        return self::buildServiceTools($service->name, $tables);
     }
 
     /**
@@ -265,12 +336,86 @@ class ToolRegistry
             $tools[] = new ToolDefinition(
                 name: "mcp_{$svc}__" . $raw['name'],
                 description: (string) ($raw['description'] ?? "MCP tool '{$raw['name']}' on service '{$svc}'."),
-                parameters: is_array($raw['inputSchema'] ?? null)
-                    ? $raw['inputSchema']
-                    : ['type' => 'object', 'properties' => new \stdClass(), 'required' => []],
+                parameters: self::normalizeInputSchema($raw['inputSchema'] ?? null),
             );
         }
         return $tools;
+    }
+
+    /**
+     * Normalize an MCP tool's inputSchema into a JSON-schema shape the LLM
+     * providers accept. Critically, an empty `properties` must serialize as an
+     * object ({}) not an array ([]): PHP's associative json_decode turns {}
+     * into [] upstream in McpToolClient, and Anthropic rejects
+     * `input_schema.properties: []`.
+     *
+     * @param mixed $schema
+     * @return array
+     */
+    private static function normalizeInputSchema($schema): array
+    {
+        if (!is_array($schema)) {
+            return ['type' => 'object', 'properties' => new \stdClass(), 'required' => []];
+        }
+        $schema = self::sanitizeSchemaNode($schema);
+        $schema['type'] = $schema['type'] ?? 'object';
+        if (!isset($schema['properties'])) {
+            $schema['properties'] = new \stdClass();
+        }
+        return $schema;
+    }
+
+    /**
+     * Recursively coerce an MCP-supplied JSON schema into what the LLM
+     * providers accept: drop the `$schema` dialect marker (MCP emits draft-07,
+     * Anthropic wants draft 2020-12 and rejects the explicit declaration), and
+     * turn every empty `properties` map into an object ({}) rather than the
+     * array ([]) that PHP's associative json_decode produces.
+     */
+    private static function sanitizeSchemaNode(array $node): array
+    {
+        unset($node['$schema']);
+
+        // Maps-of-schemas: an empty {} decodes to [] in PHP and must be
+        // restored to an object; non-empty maps recurse into their schema
+        // values.
+        foreach (['properties', 'patternProperties', '$defs', 'definitions'] as $mapKey) {
+            if (!array_key_exists($mapKey, $node)) {
+                continue;
+            }
+            if (!is_array($node[$mapKey]) || $node[$mapKey] === []) {
+                $node[$mapKey] = new \stdClass();
+                continue;
+            }
+            $clean = [];
+            foreach ($node[$mapKey] as $name => $sub) {
+                $clean[$name] = is_array($sub) ? self::sanitizeSchemaNode($sub) : $sub;
+            }
+            $node[$mapKey] = (object) $clean;
+        }
+
+        // additionalProperties: a boolean or a schema. An empty [] is a
+        // mangled {} (permissive) — restore it; a real schema recurses.
+        if (array_key_exists('additionalProperties', $node) && is_array($node['additionalProperties'])) {
+            $node['additionalProperties'] = $node['additionalProperties'] === []
+                ? new \stdClass()
+                : self::sanitizeSchemaNode($node['additionalProperties']);
+        }
+
+        // items + combinators: single schema or arrays of schemas.
+        if (isset($node['items']) && is_array($node['items'])) {
+            $node['items'] = self::sanitizeSchemaNode($node['items']);
+        }
+        foreach (['allOf', 'anyOf', 'oneOf'] as $comb) {
+            if (isset($node[$comb]) && is_array($node[$comb])) {
+                $node[$comb] = array_map(
+                    fn ($s) => is_array($s) ? self::sanitizeSchemaNode($s) : $s,
+                    $node[$comb],
+                );
+            }
+        }
+
+        return $node;
     }
 
     /**

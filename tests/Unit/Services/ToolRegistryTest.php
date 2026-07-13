@@ -134,11 +134,12 @@ class ToolRegistryTest extends TestCase
             $byName['mysql__get_table_relationships']->description
         );
 
-        // get_tables doesn't take a tableName arg, so the hint is unnecessary.
-        $this->assertStringNotContainsString(
-            'Allowed tables',
-            $byName['mysql__get_tables']->description
-        );
+        // When the surface is table-restricted, the table-listing tool is
+        // omitted entirely: listing all tables is denied by RBAC (returns
+        // empty, which reads to the AI as "no data") and would leak the names
+        // of tables the role deliberately cannot see. The allowed names are
+        // carried in the other tools' descriptions instead.
+        $this->assertArrayNotHasKey('mysql__get_tables', $byName);
     }
 
     public function testBuildOmitsAllowedTableHintWhenAllPermitted(): void

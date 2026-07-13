@@ -15,6 +15,7 @@ class AiChatConfig extends BaseServiceConfigModel
         'ai_service_id',
         'ai_role_id',
         'default_data_services',
+        'mcp_servers',
         'system_prompt',
         'max_tool_calls',
         'max_messages',
@@ -41,16 +42,22 @@ class AiChatConfig extends BaseServiceConfigModel
                 break;
 
             case 'ai_role_id':
-                $schema['label'] = 'AI Role (data access)';
+                $schema['label'] = 'Fallback role (optional)';
                 $schema['type'] = 'integer';
-                $schema['description'] = 'When the chat runs tools (query database, list files, etc.) the AI acts under this role\'s permissions. Use a least-privilege role specifically scoped to what you want the AI to read — not the user\'s own role and not an admin role.';
-                $schema['required'] = true;
+                $schema['description'] = 'Leave blank for normal use. A conversation always runs under the signed-in user\'s own role — that role is the security boundary, so the AI can never see more than the person talking to it. This fallback role is used only when a chat is called with no user role attached (e.g. a server-to-server API key). Not the user\'s role and not an admin role.';
+                $schema['required'] = false;
                 break;
 
             case 'default_data_services':
-                $schema['label'] = 'Default data services';
+                $schema['label'] = 'Data services';
                 $schema['type'] = 'text';
-                $schema['description'] = 'Optional JSON array of service names the AI is allowed to read. Acts as a whitelist on top of the AI Role\'s permissions — the AI sees the intersection. Leave blank to expose every service the role can access. Example: ["dellstore_db","hr_db"]';
+                $schema['description'] = 'Optional JSON array of data service names this conversation may query, e.g. ["dellstore_db","hr_db"]. The AI sees the intersection of this list and what the caller\'s role can read. Leave blank to allow every data service the role grants.';
+                break;
+
+            case 'mcp_servers':
+                $schema['label'] = 'MCP servers';
+                $schema['type'] = 'text';
+                $schema['description'] = 'Optional JSON array of MCP service names this conversation may call as tools, e.g. ["sysco_mcp"]. The AI sees the intersection of this list and the MCP servers the caller\'s role can access. Leave blank to allow every MCP server the role grants.';
                 break;
 
             case 'system_prompt':
