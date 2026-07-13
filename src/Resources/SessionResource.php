@@ -222,6 +222,24 @@ class SessionResource extends BaseRestResource
             throw new BadRequestException('This session is no longer active.');
         }
 
+        // ── Role lifecycle re-check (the security boundary can drift) ──
+        // ai_role_id is frozen at session creation. For a non-sysadmin
+        // caller the conversation MUST keep running under the caller's
+        // CURRENT login role — if their role was changed or revoked since
+        // the session started, the frozen role may now grant access the
+        // caller no longer holds. Re-assert equality on every message and
+        // refuse if it drifted. Sysadmins are exempt: they legitimately
+        // "act as" any role (down-scoping is never an escalation).
+        if (!Session::isSysAdmin()) {
+            $currentRoleId = (int) Session::getRoleId();
+            if ($currentRoleId <= 0 || (int) $session->ai_role_id !== $currentRoleId) {
+                throw new ForbiddenException(
+                    'Your role has changed since this chat session was created, '
+                    . 'so it can no longer be used. Please start a new chat session.'
+                );
+            }
+        }
+
         // Check message count limit.
         $maxMessages = $session->chatConfig?->max_messages
             ?? config('ai-chat.max_messages_per_session', 200);
