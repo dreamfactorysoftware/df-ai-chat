@@ -54,6 +54,9 @@ class DataToolClient
                 'Content-Type'                 => 'application/json',
                 'X-DreamFactory-Session-Token'  => $this->sessionToken,
                 'X-DreamFactory-API-Key'        => $this->apiKey,
+                // Propagate the platform trace id so the data rows this chat
+                // turn touches join the same trace as the prompt/usage rows.
+                \DreamFactory\Core\Utility\TraceId::HEADER => \DreamFactory\Core\Utility\TraceId::get(),
             ]),
         ]);
     }

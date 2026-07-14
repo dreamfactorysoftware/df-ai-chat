@@ -50,6 +50,9 @@ class McpToolClient
                 'Content-Type'                 => 'application/json',
                 'X-DreamFactory-Session-Token' => $this->sessionToken,
                 'X-DreamFactory-API-Key'       => $this->apiKey,
+                // One chat turn = one trace: rpc tool calls carry the same
+                // platform trace id as the prompt/usage/audit rows.
+                \DreamFactory\Core\Utility\TraceId::HEADER => \DreamFactory\Core\Utility\TraceId::get(),
             ],
         ]);
     }
