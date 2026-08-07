@@ -32,9 +32,10 @@ class DataToolClient
     public static function validateServiceName(string $serviceName): void
     {
         if ($serviceName === '' || preg_match(self::SERVICE_NAME_PATTERN, $serviceName) !== 1) {
-            throw new \InvalidArgumentException(
-                'Invalid DreamFactory service name; must match [A-Za-z0-9_-]+'
-            );
+            throw new \InvalidArgumentException(sprintf(
+                'Invalid DreamFactory service name "%s"; must match [A-Za-z0-9_-]+',
+                $serviceName
+            ));
         }
     }
 
