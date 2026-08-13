@@ -32,9 +32,10 @@ class DataToolClient
     public static function validateServiceName(string $serviceName): void
     {
         if ($serviceName === '' || preg_match(self::SERVICE_NAME_PATTERN, $serviceName) !== 1) {
-            throw new \InvalidArgumentException(
-                'Invalid DreamFactory service name; must match [A-Za-z0-9_-]+'
-            );
+            throw new \InvalidArgumentException(sprintf(
+                'Invalid DreamFactory service name "%s"; must match [A-Za-z0-9_-]+',
+                $serviceName
+            ));
         }
     }
 
@@ -54,6 +55,9 @@ class DataToolClient
                 'Content-Type'                 => 'application/json',
                 'X-DreamFactory-Session-Token'  => $this->sessionToken,
                 'X-DreamFactory-API-Key'        => $this->apiKey,
+                // Propagate the platform trace id so the data rows this chat
+                // turn touches join the same trace as the prompt/usage rows.
+                \DreamFactory\Core\Utility\TraceId::HEADER => \DreamFactory\Core\Utility\TraceId::get(),
             ]),
         ]);
     }
@@ -197,7 +201,19 @@ class DataToolClient
     {
         try {
             $response = $this->client->request($method, $this->baseApiUrl . $uri, $options);
-            $body = json_decode($response->getBody()->getContents(), true);
+            $raw = $response->getBody()->getContents();
+            $body = json_decode($raw, true);
+            if (!is_array($body)) {
+                // Some PHP 8.5 setups leak deprecation/notice HTML ahead of the
+                // JSON body (e.g. PDO::MYSQL_ATTR_SSL_CA). A raw decode of the
+                // polluted string yields null, which would silently turn every
+                // tool result into an empty array. Recover by decoding from the
+                // first JSON delimiter — the same defense the chat app applies.
+                $start = strcspn($raw, '{[');
+                if ($start < strlen($raw)) {
+                    $body = json_decode(substr($raw, $start), true);
+                }
+            }
             return is_array($body) ? $body : [];
         } catch (GuzzleException $e) {
             throw new ChatException(
