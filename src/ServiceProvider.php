@@ -7,6 +7,7 @@ namespace DreamFactory\Core\AIChat;
 use DreamFactory\Core\AIChat\Models\AiChatConfig;
 use DreamFactory\Core\AIChat\Services\AiChat;
 use DreamFactory\Core\Enums\ServiceTypeGroups;
+use DreamFactory\Core\Enums\LicenseLevel;
 use DreamFactory\Core\Services\ServiceManager;
 use DreamFactory\Core\Services\ServiceType;
 
@@ -23,6 +24,7 @@ class ServiceProvider extends \Illuminate\Support\ServiceProvider
                     'label'          => 'AI Chat',
                     'description'    => 'Chat with your DreamFactory data using AI and MCP tools.',
                     'group'          => ServiceTypeGroups::AI_CHAT,
+                    'subscription_required' => LicenseLevel::SILVER,
                     'config_handler' => AiChatConfig::class,
                     'factory'        => function ($config) {
                         return new AiChat($config);
@@ -45,6 +47,7 @@ class ServiceProvider extends \Illuminate\Support\ServiceProvider
                     'label'          => 'AI Chat',
                     'description'    => 'Chat with your DreamFactory data using AI and MCP tools.',
                     'group'          => ServiceTypeGroups::AI_CHAT,
+                    'subscription_required' => LicenseLevel::SILVER,
                     'config_handler' => AiChatConfig::class,
                     'factory'        => function ($config) {
                         return new AiChat($config);

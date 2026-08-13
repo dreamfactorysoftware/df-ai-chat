@@ -41,6 +41,20 @@ class ChatOrchestrator
     /** @var ToolDefinition[] */
     private array $tools;
 
+    /**
+     * Hard allow-list of dispatchable tool names, keyed for O(1) lookup.
+     * Built from the advertised tool set ($tools) — which is itself derived
+     * from the session's role grants intersected with any per-session
+     * data_services / mcp_servers override. A tool call the AI emits that
+     * is NOT in this set is refused before dispatch: the LLM's chosen tool
+     * name is untrusted input and must never reach a live service outside
+     * the session's permitted scope, regardless of what wire-level RBAC
+     * would do with it.
+     *
+     * @var array<string, true>
+     */
+    private array $allowedToolNames;
+
     private AiChatSession $session;
     private int $maxIterations;
     private int $maxResultLength;
@@ -56,6 +70,10 @@ class ChatOrchestrator
         $this->toolClient = $toolClient;
         $this->mcpClient = $mcpClient;
         $this->tools = $tools;
+        $this->allowedToolNames = [];
+        foreach ($tools as $tool) {
+            $this->allowedToolNames[$tool->name] = true;
+        }
         $this->session = $session;
         $this->maxIterations = (int) ($session->chatConfig?->max_tool_calls
             ?? config('ai-chat.max_tool_calls_per_message', 25));
@@ -238,14 +256,17 @@ class ChatOrchestrator
      *   `mcp_<svc>__<tool>`   → MCP service via McpToolClient
      *   `<svc>__<tool>`       → data service via DataToolClient
      *
-     * Access control is enforced at the wire — every dispatched call
+     * Defense in depth. The wire is the last line — every dispatched call
      * carries the AI agent's JWT + the role-bound app's API key, and
      * DreamFactory's standard RBAC pipeline gates the request server-side.
-     * The orchestrator does NOT pre-filter against an allow-list anymore:
-     * Captain's directive is "the role is the only bottleneck", and
-     * every parallel allow-list we used to keep is now removed. If the
-     * role lost access since session creation, the call gets a 403 and
-     * we surface it back to the AI as a tool error.
+     * But the tool NAME the LLM emits is untrusted: a prompt-injected or
+     * hallucinating model can name a service the conversation was never
+     * scoped to. So before any dispatch we hard-gate the call against the
+     * session's advertised tool surface (assertToolAllowed()). A call whose
+     * target service is not in the session's permitted set (role grants ∩
+     * data_services / mcp_servers override) is REFUSED here — it never
+     * reaches a live service — and the denial is surfaced back to the AI
+     * as a tool error.
      *
      * @return array{content: string, is_error: bool, latency_ms: int}
      */
@@ -254,6 +275,8 @@ class ChatOrchestrator
         $start = hrtime(true);
 
         try {
+            $this->assertToolAllowed($toolCall);
+
             $data = ToolRegistry::isMcpTool($toolCall['name'])
                 ? $this->dispatchMcpTool($toolCall)
                 : $this->dispatchDataTool($toolCall);
@@ -282,6 +305,42 @@ class ChatOrchestrator
                 'latency_ms' => $latencyMs,
             ];
         }
+    }
+
+    /**
+     * Hard allow-list gate. Reject any tool call whose name is not in the
+     * session's advertised tool surface — i.e. whose target service is not
+     * in the session's permitted set (role grants ∩ data_services /
+     * mcp_servers override). Thrown before dispatch so a denied call never
+     * touches a live service; executeTool() catches it and surfaces the
+     * denial to the AI as a tool error.
+     *
+     * @throws ChatException when the tool is outside the session's scope.
+     */
+    private function assertToolAllowed(array $toolCall): void
+    {
+        $name = (string) ($toolCall['name'] ?? '');
+
+        if (isset($this->allowedToolNames[$name])) {
+            return;
+        }
+
+        [$svc] = ToolRegistry::parseToolName($name);
+        $svc = ToolRegistry::unwrapMcpServiceName($svc);
+
+        Log::warning('AI Chat tool call denied by allow-list', [
+            'session_id' => $this->session->id,
+            'ai_role_id' => $this->session->ai_role_id,
+            'tool'       => $name,
+            'service'    => $svc,
+        ]);
+
+        throw new ChatException(
+            "Access denied: this chat session is not permitted to call tool "
+            . "'{$name}'"
+            . ($svc !== '' ? " (service '{$svc}')" : '')
+            . '. That service is outside the session\'s allowed scope.'
+        );
     }
 
     /**
