@@ -6,6 +6,7 @@ namespace DreamFactory\Core\AIChat\Services;
 
 use DreamFactory\Core\AI\Providers\AiProviderInterface;
 use DreamFactory\Core\AI\Providers\ToolDefinition;
+use DreamFactory\Core\AI\Services\BudgetAlerter;
 use DreamFactory\Core\AI\Utility\AuditDispatcher;
 use DreamFactory\Core\AI\Utility\PromptLogger;
 use DreamFactory\Core\AI\Utility\UsageLogger;
@@ -170,6 +171,7 @@ class ChatOrchestrator
                 (int) $this->session->ai_service_id,
                 UsageLogger::requestId(),
             );
+            BudgetAlerter::afterRequest((int) $this->session->ai_service_id);
 
             // No tool calls — AI produced a final text response.
             if (empty($result['tool_calls'])) {

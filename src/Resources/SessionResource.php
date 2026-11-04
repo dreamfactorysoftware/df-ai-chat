@@ -6,6 +6,7 @@ namespace DreamFactory\Core\AIChat\Resources;
 
 use DreamFactory\Core\AI\Models\AiConnectionConfig;
 use DreamFactory\Core\AI\Providers\AiProviderFactory;
+use DreamFactory\Core\AI\Services\BudgetEnforcer;
 use DreamFactory\Core\AIChat\Exceptions\ChatException;
 use DreamFactory\Core\AIChat\Models\AiChatConfig;
 use DreamFactory\Core\AIChat\Models\AiChatMessage;
@@ -247,6 +248,11 @@ class SessionResource extends BaseRestResource
         if ($currentCount >= (int) $maxMessages) {
             throw new ChatException("Session message limit ({$maxMessages}) reached.");
         }
+
+        // Refuse with HTTP 429 at a hard cap, before the user message is
+        // saved. ponytail: one check per message, so a tool loop can pass the
+        // cap by up to max_iterations calls. Move it into the loop if that matters.
+        BudgetEnforcer::enforce((int) $session->ai_service_id);
 
         // Build the orchestrator. The AI agent's credentials (JWT + the
         // role-bound app's API key) are auto-provisioned on first use,
