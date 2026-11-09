@@ -250,8 +250,8 @@ class SessionResource extends BaseRestResource
         }
 
         // Refuse with HTTP 429 at a hard cap, before the user message is
-        // saved. ponytail: one check per message, so a tool loop can pass the
-        // cap by up to max_iterations calls. Move it into the loop if that matters.
+        // saved. ChatOrchestrator checks again before each further provider
+        // call in its tool loop.
         BudgetEnforcer::enforce((int) $session->ai_service_id);
 
         // Build the orchestrator. The AI agent's credentials (JWT + the
