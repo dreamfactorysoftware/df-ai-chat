@@ -6,6 +6,8 @@ namespace DreamFactory\Core\AIChat\Services;
 
 use DreamFactory\Core\AI\Providers\AiProviderInterface;
 use DreamFactory\Core\AI\Providers\ToolDefinition;
+use DreamFactory\Core\AI\Services\BudgetAlerter;
+use DreamFactory\Core\AI\Services\BudgetEnforcer;
 use DreamFactory\Core\AI\Utility\AuditDispatcher;
 use DreamFactory\Core\AI\Utility\PromptLogger;
 use DreamFactory\Core\AI\Utility\UsageLogger;
@@ -105,6 +107,17 @@ class ChatOrchestrator
         $toolCallsMade = 0;
 
         for ($iteration = 0; $iteration < $this->maxIterations; $iteration++) {
+            // SessionResource checked the cap once, before the first call.
+            // Every further provider call is new spend, so a tool loop must
+            // not run on past a hard stop.
+            if ($iteration > 0 && BudgetEnforcer::isBlocked((int) $this->session->ai_service_id)) {
+                $this->updateSessionCounters($totalInputTokens, $totalOutputTokens, $toolCallsMade);
+
+                throw new ChatException(
+                    'The AI budget was reached before a final answer. No further AI requests were made.'
+                );
+            }
+
             $start = hrtime(true);
 
             try {
@@ -170,6 +183,7 @@ class ChatOrchestrator
                 (int) $this->session->ai_service_id,
                 UsageLogger::requestId(),
             );
+            BudgetAlerter::afterRequest((int) $this->session->ai_service_id);
 
             // No tool calls — AI produced a final text response.
             if (empty($result['tool_calls'])) {
