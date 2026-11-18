@@ -81,4 +81,25 @@ class ChatOrchestratorTest extends TestCase
         // rather than silently breaking dashboard charts the day after merge.
         $this->assertSame('chat-session', ChatOrchestrator::USAGE_RESOURCE);
     }
+
+    // ─── budget cap inside the tool loop ──────────────────────────────────
+
+    public function testToolLoopChecksTheBudgetBeforeEachFurtherProviderCall(): void
+    {
+        // sendMessage() needs Eloquent and a provider, so this pins the source:
+        // the cap is checked inside the loop, on later iterations, before the
+        // provider is called. One message can make up to max_tool_calls calls.
+        $source = (string) file_get_contents(dirname(__DIR__, 3) . '/src/Services/ChatOrchestrator.php');
+        $loop = substr($source, (int) strpos($source, 'public function sendMessage('));
+
+        $forPos = strpos($loop, 'for ($iteration = 0;');
+        $checkPos = strpos($loop, '$iteration > 0 && BudgetEnforcer::isBlocked(');
+        $callPos = strpos($loop, '$this->provider->chatWithTools(');
+
+        $this->assertNotFalse($forPos);
+        $this->assertNotFalse($checkPos, 'sendMessage() must check BudgetEnforcer::isBlocked() on later iterations.');
+        $this->assertNotFalse($callPos);
+        $this->assertGreaterThan($forPos, $checkPos, 'The budget check must be inside the loop.');
+        $this->assertLessThan($callPos, $checkPos, 'The budget check must come before the provider call.');
+    }
 }
